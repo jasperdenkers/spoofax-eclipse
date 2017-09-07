@@ -11,12 +11,14 @@ import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
+import org.eclipse.core.runtime.OperationCanceledException;
 import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.core.runtime.jobs.Job;
 import org.eclipse.ui.IEditorInput;
 import org.metaborg.core.MetaborgException;
 import org.metaborg.core.MetaborgRuntimeException;
 import org.metaborg.core.analysis.AnalysisException;
+import org.metaborg.core.analysis.AnalyzeResult;
 import org.metaborg.core.analysis.IAnalysisService;
 import org.metaborg.core.analysis.IAnalyzeResult;
 import org.metaborg.core.analysis.IAnalyzeUnit;
@@ -31,6 +33,7 @@ import org.metaborg.core.messages.MessageFactory;
 import org.metaborg.core.messages.MessageType;
 import org.metaborg.core.outline.IOutline;
 import org.metaborg.core.outline.IOutlineService;
+import org.metaborg.core.processing.analyze.IAnalysisResultRequester;
 import org.metaborg.core.processing.analyze.IAnalysisResultUpdater;
 import org.metaborg.core.processing.parse.IParseResultUpdater;
 import org.metaborg.core.project.IProject;
@@ -46,6 +49,7 @@ import org.metaborg.core.syntax.ParseException;
 import org.metaborg.core.unit.IInputUnitService;
 import org.metaborg.spoofax.core.style.CategorizerValidator;
 import org.metaborg.spoofax.eclipse.job.ThreadKillerJob;
+import org.metaborg.spoofax.eclipse.processing.Monitor;
 import org.metaborg.spoofax.eclipse.resource.IEclipseResourceService;
 import org.metaborg.spoofax.eclipse.util.MarkerUtils;
 import org.metaborg.spoofax.eclipse.util.Nullable;
@@ -74,13 +78,17 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
     private final IOutlineService<P, A> outlineService;
     private final IParseResultUpdater<P> parseResultProcessor;
     private final IAnalysisResultUpdater<P, A> analysisResultProcessor;
+    private final IAnalysisResultRequester<I, A> analysisResultRequester;
 
     private final IEclipseEditor<F> editor;
     private final IEditorInput input;
     private final @Nullable IResource eclipseResource;
     private final FileObject resource;
     private final String text;
+    private final boolean changed;
     private final boolean instantaneous;
+    private final long analysisDelayMs;
+    private final boolean analysis;
 
     private ThreadKillerJob threadKiller;
 
@@ -90,8 +98,10 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
         IProjectService projectService, IInputUnitService<I> unitService, ISyntaxService<I, P> syntaxService,
         IAnalysisService<P, A, AU> analyzer, ICategorizerService<P, A, F> categorizer, IStylerService<F> styler,
         IOutlineService<P, A> outlineService, IParseResultUpdater<P> parseResultProcessor,
-        IAnalysisResultUpdater<P, A> analysisResultProcessor, IEclipseEditor<F> editor, IEditorInput input,
-        @Nullable IResource eclipseResource, FileObject resource, String text, boolean instantaneous) {
+        IAnalysisResultUpdater<P, A> analysisResultProcessor, IAnalysisResultRequester<I, A> analysisResultRequester,
+        IEclipseEditor<F> editor, IEditorInput input, @Nullable IResource eclipseResource, FileObject resource,
+        String text, boolean changed, boolean instantaneous,
+        long analysisDelayMs, boolean analysis) {
         super("Updating Spoofax editor for " + resource.toString());
         setPriority(Job.SHORT);
 
@@ -107,13 +117,17 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
         this.outlineService = outlineService;
         this.parseResultProcessor = parseResultProcessor;
         this.analysisResultProcessor = analysisResultProcessor;
+        this.analysisResultRequester = analysisResultRequester;
 
         this.editor = editor;
         this.input = input;
         this.eclipseResource = eclipseResource;
         this.resource = resource;
         this.text = text;
+        this.changed = changed;
         this.instantaneous = instantaneous;
+        this.analysisDelayMs = analysisDelayMs;
+        this.analysis = analysis;
     }
 
 
@@ -128,14 +142,8 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
 
         try {
             final IStatus status = update(workspace, monitor);
-            if(threadKiller != null) {
-                threadKiller.cancel();
-            }
             return status;
         } catch(MetaborgRuntimeException | MetaborgException | CoreException e) {
-            if(threadKiller != null) {
-                threadKiller.cancel();
-            }
             if(monitor.isCanceled()) {
                 return StatusUtils.cancel();
             }
@@ -164,15 +172,18 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
             final String message = logger.format("Failed to update editor for {}", resource);
             logger.error(message, e);
             return StatusUtils.silentError(message, e);
-        } catch(CancellationException e) {
+        } catch(InterruptedException | CancellationException | ThreadDeath e) {
             return StatusUtils.cancel();
-        } catch(ThreadDeath e) {
-            throw e;
+        } catch(OperationCanceledException e) {
+            return StatusUtils.cancel();
         } catch(Throwable e) {
             final String message = logger.format("Failed to update editor for {}", resource);
             logger.error(message, e);
             return StatusUtils.silentError(message, e);
         } finally {
+            if(threadKiller != null) {
+                threadKiller.cancel();
+            }
             monitor.done();
         }
     }
@@ -191,39 +202,39 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
 
 
     private IStatus update(IWorkspace workspace, final IProgressMonitor progressMonitor)
-        throws MetaborgException, CoreException {
-        final SubMonitor monitor = SubMonitor.convert(progressMonitor, 11);
+        throws MetaborgException, CoreException, InterruptedException, ThreadDeath {
+        final SubMonitor monitor = SubMonitor.convert(progressMonitor, 95);
+        final Monitor spxMonitor = new Monitor(monitor);
 
-        monitor.subTask("Identifying language");
+        spxMonitor.setDescription("Identifying language");
         final IProject project = projectService.get(resource);
         final IdentifiedResource identified = languageIdentifierService.identifyToResource(resource, project);
         if(identified == null) {
             throw new MetaborgException("Language could not be identified");
         }
         final ILanguageImpl langImpl = identified.language;
-        monitor.worked(1);
+        spxMonitor.work(5);
 
-        if(monitor.isCanceled())
+        if(spxMonitor.cancelled())
             return StatusUtils.cancel();
-        monitor.subTask("Parsing");
-        final I input = unitService.inputUnit(resource, text, langImpl, identified.dialect);
-        final P parseResult = parse(input);
-        monitor.worked(1);
+        spxMonitor.setDescription("Parsing");
+        final I inputUnit = unitService.inputUnit(resource, text, langImpl, identified.dialect);
+        final P parseResult = parse(inputUnit, spxMonitor.subProgress(20));
 
         if(parseResult.valid()) {
-            if(monitor.isCanceled())
+            if(spxMonitor.cancelled())
                 return StatusUtils.cancel();
-            monitor.subTask("Styling");
+            spxMonitor.setDescription("Styling");
             style(monitor, langImpl, parseResult);
-            monitor.worked(1);
+            spxMonitor.work(5);
 
-            if(monitor.isCanceled())
+            if(spxMonitor.cancelled())
                 return StatusUtils.cancel();
-            monitor.subTask("Creating outline");
+            spxMonitor.setDescription("Creating outline");
             outline(monitor, langImpl, parseResult);
-            monitor.worked(1);
+            spxMonitor.work(5);
         } else {
-            monitor.worked(2);
+            spxMonitor.work(10);
         }
 
         // Just parse when eclipse resource is null, skip the rest. Analysis only works with a project context,
@@ -235,22 +246,20 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
         // Sleep before showing parse messages to prevent showing irrelevant messages while user is still typing.
         if(!instantaneous) {
             try {
-                monitor.subTask("Waiting");
+                spxMonitor.setDescription("Waiting");
                 Thread.sleep(300);
             } catch(InterruptedException e) {
                 return StatusUtils.cancel();
             }
         }
-        monitor.worked(1);
 
-        if(monitor.isCanceled())
+        if(spxMonitor.cancelled())
             return StatusUtils.cancel();
-        monitor.subTask("Processing parse messages");
-        parseMessages(workspace, monitor.newChild(1), parseResult);
-        monitor.worked(1);
+        spxMonitor.setDescription("Processing parse messages");
+        parseMessages(workspace, spxMonitor.subProgress(5), parseResult);
 
-        // Stop if parsing produced an invalid result.
-        if(!parseResult.valid()) {
+        // Stop if parsing produced an invalid result, or if analysis is disabled.
+        if(!parseResult.valid() || !analysis) {
             return StatusUtils.silentError();
         }
 
@@ -262,36 +271,40 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
         // Sleep before analyzing to prevent running many analyses when small edits are made in succession.
         if(!instantaneous) {
             try {
-                monitor.subTask("Waiting");
-                Thread.sleep(300);
+                spxMonitor.setDescription("Waiting");
+                Thread.sleep(analysisDelayMs);
             } catch(InterruptedException e) {
                 return StatusUtils.cancel();
             }
         }
-        monitor.worked(1);
 
-        if(monitor.isCanceled())
+        if(spxMonitor.cancelled())
             return StatusUtils.cancel();
-        monitor.subTask("Analyzing");
+        spxMonitor.setDescription("Analyzing");
+        
         final IContext context = contextService.get(resource, project, langImpl);
-        final IAnalyzeResult<A, AU> analysisResult = analyze(parseResult, context);
-        monitor.worked(1);
-
-        if(monitor.isCanceled())
+        final IAnalyzeResult<A, AU> analysisResult ;
+        final A result = analysisResultRequester.get(resource);
+        if(changed || result == null) {
+            analysisResult = analyze(parseResult, context, spxMonitor.subProgress(50));
+        } else {
+            analysisResult = new AnalyzeResult<>(result, context);
+        }
+        
+        if(spxMonitor.cancelled())
             return StatusUtils.cancel();
-        monitor.subTask("Processing analysis messages");
-        analysisMessages(workspace, monitor.newChild(1), analysisResult);
-        monitor.worked(1);
+        spxMonitor.setDescription("Processing analysis messages");
+        analysisMessages(workspace, spxMonitor.subProgress(5), analysisResult);
 
         return StatusUtils.success();
     }
 
 
-    private P parse(I input) throws ParseException, ThreadDeath {
+    private P parse(I input, Monitor monitor) throws ParseException, InterruptedException, ThreadDeath {
         final P parseResult;
         try {
             parseResultProcessor.invalidate(resource);
-            parseResult = syntaxService.parse(input);
+            parseResult = syntaxService.parse(input, monitor, monitor);
             parseResultProcessor.update(resource, parseResult);
         } catch(ParseException e) {
             parseResultProcessor.error(resource, e);
@@ -324,8 +337,7 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
         editor.setOutline(outline, monitor);
     }
 
-    private void parseMessages(IWorkspace workspace, IProgressMonitor monitor, final P parseResult)
-        throws CoreException {
+    private void parseMessages(IWorkspace workspace, Monitor monitor, final P parseResult) throws CoreException {
         // Update markers atomically using a workspace runnable, to prevent flashing/jumping markers.
         final IWorkspaceRunnable parseMarkerUpdater = new IWorkspaceRunnable() {
             @Override public void run(IProgressMonitor workspaceMonitor) throws CoreException {
@@ -338,15 +350,16 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
                 }
             }
         };
-        workspace.run(parseMarkerUpdater, eclipseResource, IWorkspace.AVOID_UPDATE, monitor);
+        workspace.run(parseMarkerUpdater, eclipseResource, IWorkspace.AVOID_UPDATE, monitor.eclipseMonitor());
     }
 
-    private IAnalyzeResult<A, AU> analyze(P parseResult, IContext context) throws AnalysisException, ThreadDeath {
+    private IAnalyzeResult<A, AU> analyze(P parseResult, IContext context, Monitor monitor)
+        throws AnalysisException, InterruptedException, ThreadDeath {
         final IAnalyzeResult<A, AU> analysisResult;
         try(IClosableLock lock = context.write()) {
             analysisResultProcessor.invalidate(parseResult.source());
             try {
-                analysisResult = analyzer.analyze(parseResult, context);
+                analysisResult = analyzer.analyze(parseResult, context, monitor, monitor);
             } catch(AnalysisException e) {
                 analysisResultProcessor.error(resource, e);
                 throw e;
@@ -359,8 +372,8 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
         return analysisResult;
     }
 
-    private void analysisMessages(IWorkspace workspace, IProgressMonitor monitor,
-        final IAnalyzeResult<A, AU> analysisResult) throws CoreException {
+    private void analysisMessages(IWorkspace workspace, Monitor monitor, final IAnalyzeResult<A, AU> analysisResult)
+        throws CoreException {
         // Update markers atomically using a workspace runnable, to prevent flashing/jumping markers.
         final IWorkspaceRunnable analysisMarkerUpdater = new IWorkspaceRunnable() {
             @Override public void run(IProgressMonitor workspaceMonitor) throws CoreException {
@@ -399,6 +412,6 @@ public class EditorUpdateJob<I extends IInputUnit, P extends IParseUnit, A exten
                 }
             }
         };
-        workspace.run(analysisMarkerUpdater, eclipseResource, IWorkspace.AVOID_UPDATE, monitor);
+        workspace.run(analysisMarkerUpdater, eclipseResource, IWorkspace.AVOID_UPDATE, monitor.eclipseMonitor());
     }
 }

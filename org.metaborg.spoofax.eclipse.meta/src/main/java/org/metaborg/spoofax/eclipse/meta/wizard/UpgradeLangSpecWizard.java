@@ -28,6 +28,7 @@ import org.metaborg.spoofax.eclipse.meta.nature.SpoofaxMetaNature;
 import org.metaborg.spoofax.eclipse.resource.IEclipseResourceService;
 import org.metaborg.spoofax.eclipse.util.BuilderUtils;
 import org.metaborg.spoofax.eclipse.util.NatureUtils;
+import org.metaborg.spoofax.eclipse.util.Nullable;
 import org.metaborg.spoofax.eclipse.util.StatusUtils;
 import org.metaborg.spoofax.meta.core.config.ISpoofaxLanguageSpecConfigBuilder;
 import org.metaborg.spoofax.meta.core.config.SdfVersion;
@@ -99,13 +100,11 @@ public class UpgradeLangSpecWizard extends Wizard {
             final ILanguageSpec languageSpec = languageSpecService.get(metaborgProject);
             if(languageSpec != null) {
                 final ILanguageSpecConfig config = languageSpec.config();
-                if(config != null) {
-                    final LanguageIdentifier identifier = config.identifier();
-                    groupId = Strings.isNullOrEmpty(groupId) ? identifier.groupId : groupId;
-                    id = Strings.isNullOrEmpty(id) ? identifier.id : id;
-                    version = Strings.isNullOrEmpty(version) ? identifier.version.toString() : version;
-                    name = Strings.isNullOrEmpty(name) ? config.name() : name;
-                }
+                final LanguageIdentifier identifier = config.identifier();
+                groupId = Strings.isNullOrEmpty(groupId) ? identifier.groupId : groupId;
+                id = Strings.isNullOrEmpty(id) ? identifier.id : id;
+                version = Strings.isNullOrEmpty(version) ? identifier.version.toString() : version;
+                name = Strings.isNullOrEmpty(name) ? config.name() : name;
             }
         } catch(ConfigException e) {
             // Ignore
@@ -267,14 +266,20 @@ public class UpgradeLangSpecWizard extends Wizard {
         final LangSpecGenerator newGenerator = new LangSpecGenerator(settings);
         newGenerator.generateIgnoreFile();
         newGenerator.generatePOM();
-        SdfVersion version;
+        final @Nullable SdfVersion version;
+        final boolean enabled;
         if(settings.syntaxType == SyntaxType.SDF2) {
             version = SdfVersion.sdf2;
-        } else {
+            enabled = true;
+        } else if(settings.syntaxType == SyntaxType.SDF3) {
             version = SdfVersion.sdf3;
+            enabled = true;
+        } else {
+            version = null;
+            enabled = false;
         }
         final ContinuousLanguageSpecGenerator generator =
-            new ContinuousLanguageSpecGenerator(settings.generatorSettings, version);
+            new ContinuousLanguageSpecGenerator(settings.generatorSettings, enabled, version);
         generator.generateAll();
     }
 }
